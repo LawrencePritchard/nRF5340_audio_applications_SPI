@@ -12,6 +12,8 @@ nRF5340 Audio DK - SPI Audio Bridge
  * The SPI transaction size is one I2S block = BLK_MULTI_CHAN_SIZE_OCTETS bytes,
  * transmitted every 1 ms to match the I2S interrupt cadence.
  */
+Errors arose during the build process so the code is not fully functional
+
 
 
 The following is the readme for the unicast server app
