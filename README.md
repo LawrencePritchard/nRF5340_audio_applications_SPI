@@ -20,7 +20,7 @@ Errors arose during the build process so the code is not fully functional
 
 
 
-The following is the readme for the unicast server app
+## The following is the readme for the unicast server app
 
 .. _nrf53_audio_unicast_server_app:
 
