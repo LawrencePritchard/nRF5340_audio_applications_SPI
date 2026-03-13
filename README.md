@@ -1,7 +1,9 @@
 # nRF5340 Audio: Unicast server with SPI
 
 This application modifies the nRF5340 audio applications unicast server code to replace Bluetooth with SPI.
-nRF5340 Audio DK - SPI Audio Bridge
+nRF5340 Audio DK - SPI Audio Bridge.
+
+The main changes are to the unicast_server/main.c and src/audio/audio_datapath.c
 
 ## Audio data flow
 
