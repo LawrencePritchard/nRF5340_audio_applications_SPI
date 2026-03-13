@@ -1019,6 +1019,25 @@ void audio_datapath_stream_out(struct net_buf *audio_frame_in)
 	meta_out->data_rx_ts_us = meta_in->data_rx_ts_us;
 	meta_out->bad_data = meta_in->bad_data;
 
+	if (meta_in->data_coding == PCM) {
+        // Data from Apollo is already decoded PCM.
+        // Copy it straight into the output FIFO, mirroring what the
+        // memcpy loop below does after sw_codec_decode().
+        uint32_t out_blk_idx = ctrl_blk.out.prod_blk_idx;
+        for (uint32_t i = 0; i < NUM_BLKS_IN_FRAME; i++) {
+            memcpy(&ctrl_blk.out.fifo[out_blk_idx * BLK_MULTI_CHAN_NUM_SAMPS],
+                   (int16_t *)audio_frame_in->data,
+                   BLK_MULTI_CHAN_SIZE_OCTETS);
+            net_buf_pull(audio_frame_in, BLK_MULTI_CHAN_SIZE_OCTETS);
+            ctrl_blk.out.prod_blk_ts[out_blk_idx] =
+                meta_in->data_rx_ts_us + (i * BLK_PERIOD_US);
+            out_blk_idx = NEXT_IDX(out_blk_idx);
+        }
+        ctrl_blk.out.prod_blk_idx = out_blk_idx;
+        net_buf_unref(audio_frame_out);  // free the unused alloc above
+        return;
+    }
+	
 	ret = sw_codec_decode(audio_frame_in, audio_frame_out);
 	if (ret) {
 		net_buf_unref(audio_frame_out);

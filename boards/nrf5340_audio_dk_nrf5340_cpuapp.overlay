@@ -40,4 +40,14 @@
 			label = "Green LED 1";
 		};
 	};
+
+	my_spi_master: &spi4 {
+	cs-gpios = <&gpio0 11 GPIO_ACTIVE_LOW>, <&gpio0 17 GPIO_ACTIVE_LOW>, <&gpio1 8 GPIO_ACTIVE_LOW>;
+	reg_my_spi_master: spi-dev-a@2 {
+		reg = <2>;
+	};
+	};
+
+
+
 };

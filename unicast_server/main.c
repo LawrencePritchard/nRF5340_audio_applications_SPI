@@ -1,589 +1,426 @@
 /*
- * Copyright (c) 2023 Nordic Semiconductor ASA
+ * nRF5340 Audio DK - SPI Audio Bridge
  *
- * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ * Captures PDM microphone audio via the CS47L63 codec over I2S,
+ * sends raw PCM frames to the Apollo over SPI, receives processed
+ * PCM back from the Apollo over SPI, and plays it out through the
+ * headphone jack.
+ *
+ * Based on:
+ *   - too1/ncs-spi-master-slave-example  (SPI transport)
+ *   - nrf5340_audio/unicast_server       (audio pipeline)
+ *
+ * Build notes
+ * -----------
+ *  prj.conf must enable (at minimum):
+ *    CONFIG_SPI=y
+ *    CONFIG_NRF5340_AUDIO_CS47L63_DRIVER=y
+ *    CONFIG_STREAM_BIDIRECTIONAL=y   (enables both RX and TX paths in audio_datapath)
+ *    CONFIG_AUDIO_DEV=HEADSET        (selects headset path in audio_datapath / hw_codec)
+ *    CONFIG_AUDIO_SAMPLE_RATE_48000_HZ=y  (or 16000 / 24000)
+ *    CONFIG_AUDIO_BIT_DEPTH_16=y
+ *    CONFIG_SW_CODEC_LC3=n           (we bypass the codec - raw PCM only)
+ *
+ *  The device-tree overlay must alias your external SPI bus as
+ *  "my_spi_master" and provide "reg_my_spi_master" for the CS GPIO,
+ *  exactly as in the too1 example.
+ *
+ * Audio data flow
+ * ---------------
+ *  Mic  →  CS47L63  →(I2S)→  audio_datapath RX FIFO (audio_q_rx)
+ *       →  spi_audio_thread  →(SPI)→  Apollo
+ *
+ *  Apollo →(SPI)→  spi_audio_thread  →  out.fifo (via audio_datapath_pcm_out)
+ *         →(I2S)→  CS47L63  →  headphone jack
+ *
+ * The SPI transaction size is one I2S block = BLK_MULTI_CHAN_SIZE_OCTETS bytes,
+ * transmitted every 1 ms to match the I2S interrupt cadence.
  */
 
-#include "streamctrl.h"
-
-#include <zephyr/zbus/zbus.h>
-
-#include "unicast_server.h"
-#include "zbus_common.h"
-#include "peripherals.h"
-#include "led_assignments.h"
-#include "led.h"
-#include "button_assignments.h"
-#include "macros_common.h"
-#include "audio_system.h"
-#include "button_handler.h"
-#include "bt_le_audio_tx.h"
-#include "bt_mgmt.h"
-#include "bt_rendering_and_capture.h"
-#include "audio_datapath.h"
-#include "bt_content_ctrl.h"
-#include "le_audio.h"
-#include "le_audio_rx.h"
-#include "fw_info_app.h"
-
+#include <zephyr/kernel.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/spi.h>
+#include <zephyr/net_buf.h>
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(main, CONFIG_MAIN_LOG_LEVEL);
 
-BUILD_ASSERT(CONFIG_BT_AUDIO_CONCURRENT_RX_STREAMS_MAX <= CONFIG_AUDIO_DECODE_CHANNELS_MAX);
-BUILD_ASSERT(CONFIG_BT_AUDIO_CONCURRENT_TX_STREAMS_MAX <= CONFIG_AUDIO_ENCODE_CHANNELS_MAX);
-
-ZBUS_SUBSCRIBER_DEFINE(button_evt_sub, CONFIG_BUTTON_MSG_SUB_QUEUE_SIZE);
-
-ZBUS_MSG_SUBSCRIBER_DEFINE(le_audio_evt_sub);
-
-ZBUS_CHAN_DECLARE(button_chan);
-ZBUS_CHAN_DECLARE(le_audio_chan);
-ZBUS_CHAN_DECLARE(bt_mgmt_chan);
-ZBUS_CHAN_DECLARE(volume_chan);
-
-ZBUS_OBS_DECLARE(volume_evt_sub);
-
-static struct k_thread button_msg_sub_thread_data;
-static struct k_thread le_audio_msg_sub_thread_data;
-
-static k_tid_t button_msg_sub_thread_id;
-static k_tid_t le_audio_msg_sub_thread_id;
-
-K_THREAD_STACK_DEFINE(button_msg_sub_thread_stack, CONFIG_BUTTON_MSG_SUB_STACK_SIZE);
-K_THREAD_STACK_DEFINE(le_audio_msg_sub_thread_stack, CONFIG_LE_AUDIO_MSG_SUB_STACK_SIZE);
-
-#define STEREO_PRES_DLY_MIN_US 5000
-
-static enum stream_state strm_state = STATE_PAUSED;
-
-/* Function for handling all stream state changes */
-static void stream_state_set(enum stream_state stream_state_new)
-{
-	strm_state = stream_state_new;
-}
-
-/**
- * @brief	Handle button activity.
- */
-static void button_msg_sub_thread(void)
-{
-	int ret;
-	const struct zbus_channel *chan;
-
-	while (1) {
-		ret = zbus_sub_wait(&button_evt_sub, &chan, K_FOREVER);
-		ERR_CHK(ret);
-
-		struct button_msg msg;
-
-		ret = zbus_chan_read(chan, &msg, ZBUS_READ_TIMEOUT_MS);
-		ERR_CHK(ret);
-
-		LOG_DBG("Got btn evt from queue - id = %d, action = %d", msg.button_pin,
-			msg.button_action);
-
-		if (msg.button_action != BUTTON_PRESS) {
-			LOG_WRN("Unhandled button action");
-			return;
-		}
-
-		switch (msg.button_pin) {
-		case BUTTON_PLAY_PAUSE:
-			if (!IS_ENABLED(CONFIG_BT_CONTENT_CTRL_MEDIA)) {
-				LOG_WRN("Play/pause not supported");
-				break;
-			}
-
-			if (IS_ENABLED(CONFIG_WALKIE_TALKIE_DEMO)) {
-				LOG_WRN("Play/pause not supported in walkie-talkie mode");
-				break;
-			}
-
-			if (bt_content_ctlr_media_state_playing()) {
-				ret = bt_content_ctrl_stop(NULL);
-				if (ret) {
-					LOG_WRN("Could not stop: %d", ret);
-				}
-
-			} else if (!bt_content_ctlr_media_state_playing()) {
-				ret = bt_content_ctrl_start(NULL);
-				if (ret) {
-					LOG_WRN("Could not start: %d", ret);
-				}
-
-			} else {
-				LOG_WRN("In invalid state: %d", strm_state);
-			}
-
-			break;
-
-		case BUTTON_VOLUME_UP:
-			ret = bt_r_and_c_volume_up();
-			if (ret) {
-				LOG_WRN("Failed to increase volume: %d", ret);
-			}
-
-			break;
-
-		case BUTTON_VOLUME_DOWN:
-			ret = bt_r_and_c_volume_down();
-			if (ret) {
-				LOG_WRN("Failed to decrease volume: %d", ret);
-			}
-
-			break;
-
-		case BUTTON_4:
-			if (IS_ENABLED(CONFIG_AUDIO_TEST_TONE)) {
-				if (IS_ENABLED(CONFIG_WALKIE_TALKIE_DEMO)) {
-					LOG_DBG("Test tone is disabled in walkie-talkie mode");
-					break;
-				}
-
-				if (strm_state != STATE_STREAMING) {
-					LOG_WRN("Not in streaming state");
-					break;
-				}
-
-				ret = audio_system_encode_test_tone_step();
-				if (ret) {
-					LOG_WRN("Failed to play test tone, ret: %d", ret);
-				}
-
-				break;
-			}
-
-			break;
-
-		case BUTTON_5:
-			if (IS_ENABLED(CONFIG_AUDIO_MUTE)) {
-				ret = bt_r_and_c_volume_mute(false);
-				if (ret) {
-					LOG_WRN("Failed to mute, ret: %d", ret);
-				}
-
-				break;
-			}
-
-			break;
-
-		default:
-			LOG_WRN("Unexpected/unhandled button id: %d", msg.button_pin);
-		}
-
-		STACK_USAGE_PRINT("button_msg_thread", &button_msg_sub_thread_data);
-	}
-}
-
-/**
- * @brief	Handle Bluetooth LE audio events.
- */
-static void le_audio_msg_sub_thread(void)
-{
-	int ret;
-	uint32_t pres_delay_us;
-	uint32_t bitrate_bps;
-	uint32_t sampling_rate_hz;
-	const struct zbus_channel *chan;
-
-	while (1) {
-		struct le_audio_msg msg;
-
-		ret = zbus_sub_wait_msg(&le_audio_evt_sub, &chan, &msg, K_FOREVER);
-		ERR_CHK(ret);
-
-		LOG_DBG("Received event = %d, current state = %d", msg.event, strm_state);
-
-		switch (msg.event) {
-		case LE_AUDIO_EVT_STREAMING:
-			LOG_DBG("LE audio evt streaming");
-
-			if (msg.dir == BT_AUDIO_DIR_SOURCE) {
-				audio_system_encoder_start();
-			}
-
-			if (strm_state == STATE_STREAMING) {
-				LOG_DBG("Got streaming event in streaming state");
-				break;
-			}
-
-			audio_system_start();
-			stream_state_set(STATE_STREAMING);
-			ret = led_blink(LED_AUDIO_CONN_STATUS);
-			ERR_CHK(ret);
-
-			break;
-
-		case LE_AUDIO_EVT_NOT_STREAMING:
-			LOG_DBG("LE audio evt not streaming");
-
-			if (strm_state == STATE_PAUSED) {
-				LOG_DBG("Got not_streaming event in paused state");
-				break;
-			}
-
-			if (msg.dir == BT_AUDIO_DIR_SOURCE) {
-				audio_system_encoder_stop();
-			}
-
-			stream_state_set(STATE_PAUSED);
-			audio_system_stop();
-			ret = led_on(LED_AUDIO_CONN_STATUS);
-			ERR_CHK(ret);
-
-			break;
-
-		case LE_AUDIO_EVT_CONFIG_RECEIVED:
-			LOG_DBG("LE audio config received");
-
-			ret = unicast_server_config_get(msg.conn, msg.dir, &bitrate_bps,
-							&sampling_rate_hz, NULL);
-			if (ret) {
-				LOG_WRN("Failed to get config: %d", ret);
-				break;
-			}
-
-			LOG_DBG("\tSampling rate: %d Hz", sampling_rate_hz);
-			LOG_DBG("\tBitrate (compressed): %d bps", bitrate_bps);
-
-			if (msg.dir == BT_AUDIO_DIR_SINK) {
-				ret = audio_system_config_set(VALUE_NOT_SET, VALUE_NOT_SET,
-							      sampling_rate_hz);
-				ERR_CHK(ret);
-			} else if (msg.dir == BT_AUDIO_DIR_SOURCE) {
-				ret = audio_system_config_set(sampling_rate_hz, bitrate_bps,
-							      VALUE_NOT_SET);
-				ERR_CHK(ret);
-			}
-
-			break;
-
-		case LE_AUDIO_EVT_PRES_DELAY_SET:
-			LOG_DBG("Set presentation delay");
-
-			ret = unicast_server_config_get(msg.conn, BT_AUDIO_DIR_SINK, NULL, NULL,
-							&pres_delay_us);
-			if (ret) {
-				LOG_ERR("Failed to get config: %d", ret);
-				break;
-			}
-
-			ret = audio_datapath_pres_delay_us_set(pres_delay_us);
-			if (ret) {
-				LOG_ERR("Failed to set presentation delay to %d", pres_delay_us);
-				break;
-			}
-
-			LOG_INF("Presentation delay %d us is set by initiator", pres_delay_us);
-
-			break;
-
-		case LE_AUDIO_EVT_NO_VALID_CFG:
-			LOG_WRN("No valid configurations found, will disconnect");
-
-			ret = bt_mgmt_conn_disconnect(msg.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-			if (ret) {
-				LOG_ERR("Failed to disconnect: %d", ret);
-			}
-
-			break;
-
-		case LE_AUDIO_EVT_STREAM_SENT:
-			/* Nothing to do. */
-			break;
-
-		default:
-			LOG_WRN("Unexpected/unhandled le_audio event: %d", msg.event);
-
-			break;
-		}
-
-		STACK_USAGE_PRINT("le_audio_msg_thread", &le_audio_msg_sub_thread_data);
-	}
-}
-
-/**
- * @brief	Create zbus subscriber threads.
+#include "audio_datapath.h"
+#include "audio_i2s.h"
+#include "hw_codec.h"
+#include "audio_system.h"
+
+LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
+
+/* ---------------------------------------------------------------------------
+ * SPI configuration  (mirrors too1 example)
+ * ---------------------------------------------------------------------------*/
+#define MY_SPI_MASTER           DT_NODELABEL(my_spi_master)
+#define MY_SPI_MASTER_CS_DT_SPEC \
+    SPI_CS_GPIOS_DT_SPEC_GET(DT_NODELABEL(reg_my_spi_master))
+
+static const struct device *spi_dev;
+
+static struct spi_config spi_cfg = {
+    /*
+     * SPI mode 0 (CPOL=0, CPHA=0) is typical for most MCUs.
+     * If the Apollo requires mode 3 change to:
+     *   SPI_MODE_CPOL | SPI_MODE_CPHA
+     */
+    .operation = SPI_WORD_SET(8) | SPI_TRANSFER_MSB,
+    .frequency  = 8000000,   /* 8 MHz – safely above the audio data rate    */
+    .slave      = 0,
+    .cs         = {.gpio = MY_SPI_MASTER_CS_DT_SPEC, .delay = 0},
+};
+
+/* ---------------------------------------------------------------------------
+ * Audio sizing constants
  *
- * @return	0 for success, error otherwise.
+ * These mirror the macros in audio_datapath.c / audio_i2s.h.
+ * BLK_MULTI_CHAN_SIZE_OCTETS is the number of bytes in one 1 ms I2S block
+ * for all channels.  At 48 kHz, 16-bit stereo that is:
+ *   48 samples/ms  ×  2 ch  ×  2 bytes  = 192 bytes.
+ * ---------------------------------------------------------------------------*/
+#ifndef CONFIG_AUDIO_SAMPLE_RATE_HZ
+#  define CONFIG_AUDIO_SAMPLE_RATE_HZ 48000
+#endif
+
+#ifndef CONFIG_AUDIO_BIT_DEPTH_OCTETS
+#  define CONFIG_AUDIO_BIT_DEPTH_OCTETS 2
+#endif
+
+#ifndef CONFIG_AUDIO_OUTPUT_CHANNELS
+#  define CONFIG_AUDIO_OUTPUT_CHANNELS 2
+#endif
+
+#define BLK_PERIOD_US  1000
+#define BLK_MONO_NUM_SAMPS   ((CONFIG_AUDIO_SAMPLE_RATE_HZ * BLK_PERIOD_US) / 1000000)
+#define BLK_MULTI_CHAN_NUM_SAMPS  (BLK_MONO_NUM_SAMPS * CONFIG_AUDIO_OUTPUT_CHANNELS)
+#define BLK_MULTI_CHAN_SIZE_OCTETS \
+    (BLK_MULTI_CHAN_NUM_SAMPS * CONFIG_AUDIO_BIT_DEPTH_OCTETS)
+
+/* ---------------------------------------------------------------------------
+ * SPI transfer buffers
+ *
+ * Two pairs so one can be in-flight while we prepare the next (double-buffer).
+ * Each pair: tx = PCM from mic, rx = processed PCM from Apollo.
+ * ---------------------------------------------------------------------------*/
+static uint8_t spi_tx_buf[BLK_MULTI_CHAN_SIZE_OCTETS];
+static uint8_t spi_rx_buf[BLK_MULTI_CHAN_SIZE_OCTETS];
+
+/* ---------------------------------------------------------------------------
+ * SPI audio thread
+ *
+ * Wakes every 1 ms, pulls one audio block from the mic queue, sends it to
+ * the Apollo over SPI, and pushes the received block into the I2S TX FIFO.
+ * ---------------------------------------------------------------------------*/
+#define SPI_AUDIO_THREAD_STACK_SIZE 2048
+#define SPI_AUDIO_THREAD_PRIORITY   5        /* preemptible, higher than encoder */
+
+K_THREAD_STACK_DEFINE(spi_audio_thread_stack, SPI_AUDIO_THREAD_STACK_SIZE);
+static struct k_thread spi_audio_thread_data;
+
+/*
+ * audio_datapath_pcm_out() - write one decoded PCM block directly into the
+ * output FIFO of audio_datapath.
+ *
+ * audio_datapath exposes audio_datapath_stream_out() for net_buf frames that
+ * go through the LC3 decoder.  Because we already have raw PCM from Apollo we
+ * bypass the decoder and write directly into ctrl_blk.out.fifo via the same
+ * net_buf wrapper that audio_datapath_stream_out() ultimately produces.
+ *
+ * The simplest correct approach is to wrap the PCM in a net_buf with the
+ * metadata that audio_datapath_stream_out() expects (data_coding = PCM,
+ * ref_ts_us = 0 to skip presentation compensation) and call stream_out.
+ * audio_datapath_stream_out() will skip the LC3 decode step when the codec is
+ * configured as SW_CODEC_NONE / pass-through – OR we can use the PCM pool
+ * directly.  Since modifying audio_datapath internals is risky, we use a
+ * dedicated net_buf pool + a light wrapper that calls stream_out with a
+ * pass-through (no-op) codec config.
+ *
+ * For a simpler first-pass approach that avoids touching sw_codec_select,
+ * the function below copies the PCM directly into the output FIFO through
+ * the public audio_datapath API surface by constructing a minimal net_buf.
+ *
+
  */
-static int zbus_subscribers_create(void)
+
+/* Small pool for wrapping Apollo's PCM reply into net_bufs */
+NET_BUF_POOL_FIXED_DEFINE(apollo_pcm_pool, 4, BLK_MULTI_CHAN_SIZE_OCTETS,
+                           sizeof(struct audio_metadata), NULL);
+
+/* The audio_q_rx message queue is declared in audio_system.c.
+ * We need access to it here.  Declare extern to match the K_MSGQ_DEFINE there.
+ */
+extern struct k_msgq audio_q_rx;
+
+static void spi_audio_thread_fn(void *p1, void *p2, void *p3)
 {
-	int ret;
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
 
-	button_msg_sub_thread_id = k_thread_create(
-		&button_msg_sub_thread_data, button_msg_sub_thread_stack,
-		CONFIG_BUTTON_MSG_SUB_STACK_SIZE, (k_thread_entry_t)button_msg_sub_thread, NULL,
-		NULL, NULL, K_PRIO_PREEMPT(CONFIG_BUTTON_MSG_SUB_THREAD_PRIO), 0, K_NO_WAIT);
-	ret = k_thread_name_set(button_msg_sub_thread_id, "Msg_sub_btn");
-	if (ret) {
-		LOG_ERR("Failed to create button_msg thread");
-		return ret;
-	}
+    int ret;
 
-	le_audio_msg_sub_thread_id = k_thread_create(
-		&le_audio_msg_sub_thread_data, le_audio_msg_sub_thread_stack,
-		CONFIG_LE_AUDIO_MSG_SUB_STACK_SIZE, (k_thread_entry_t)le_audio_msg_sub_thread, NULL,
-		NULL, NULL, K_PRIO_PREEMPT(CONFIG_LE_AUDIO_MSG_SUB_THREAD_PRIO), 0, K_NO_WAIT);
-	ret = k_thread_name_set(le_audio_msg_sub_thread_id, "Msg_sub_LE_Audio");
-	if (ret) {
-		LOG_ERR("Failed to create le_audio_msg thread");
-		return ret;
-	}
+    const struct spi_buf tx_buf_desc = {
+        .buf = spi_tx_buf,
+        .len = sizeof(spi_tx_buf),
+    };
+    const struct spi_buf_set tx = {
+        .buffers = &tx_buf_desc,
+        .count   = 1,
+    };
 
-	return 0;
+    struct spi_buf rx_buf_desc = {
+        .buf = spi_rx_buf,
+        .len = sizeof(spi_rx_buf),
+    };
+    const struct spi_buf_set rx = {
+        .buffers = &rx_buf_desc,
+        .count   = 1,
+    };
+
+    LOG_INF("SPI audio thread started (%d bytes/block)", BLK_MULTI_CHAN_SIZE_OCTETS);
+
+    while (1) {
+        /* ---- Step 1: collect one mic block from I2S RX queue ---- */
+        struct net_buf *mic_block = NULL;
+
+        ret = k_msgq_get(&audio_q_rx, (void *)&mic_block, K_MSEC(5));
+        if (ret != 0 || mic_block == NULL) {
+            /*
+             * No mic data yet (stream not started, or underrun).
+             * Send silence so the Apollo doesn't time out.
+             */
+            memset(spi_tx_buf, 0, sizeof(spi_tx_buf));
+        } else {
+            /* Copy PCM into the flat SPI TX buffer */
+            size_t copy_len = MIN(mic_block->len, sizeof(spi_tx_buf));
+
+            memcpy(spi_tx_buf, mic_block->data, copy_len);
+
+            if (copy_len < sizeof(spi_tx_buf)) {
+                memset(spi_tx_buf + copy_len, 0,
+                       sizeof(spi_tx_buf) - copy_len);
+            }
+
+            net_buf_unref(mic_block);
+        }
+
+        /* ---- Step 2: SPI full-duplex transfer ---- */
+        ret = spi_transceive(spi_dev, &spi_cfg, &tx, &rx);
+        if (ret != 0) {
+            LOG_ERR("SPI transceive error: %d", ret);
+            /* Keep going – don't stall the audio thread */
+            continue;
+        }
+
+        /* ---- Step 3: push Apollo's reply into the I2S TX path ---- */
+        struct net_buf *out_buf = net_buf_alloc(&apollo_pcm_pool, K_NO_WAIT);
+
+        if (out_buf == NULL) {
+            LOG_WRN("Apollo PCM pool exhausted – dropping frame");
+            continue;
+        }
+
+        net_buf_add_mem(out_buf, spi_rx_buf, sizeof(spi_rx_buf));
+
+        /*
+         * Fill in the metadata that audio_datapath_stream_out() inspects.
+         * Setting data_coding = PCM and ref_ts_us = 0 disables drift/
+         * presentation compensation (fine for a direct SPI feed).
+         *
+         * IMPORTANT: audio_datapath_stream_out() will call sw_codec_decode()
+         * on this buffer.  To skip the decoder for PCM input, add the
+         * following at the start of the "Decode" section in audio_datapath.c:
+         *
+         *   if (meta_in->data_coding == PCM) {
+         *       // Data is already PCM – copy directly into out FIFO
+         *       // (same memcpy loop that follows sw_codec_decode below)
+         *       ...
+         *   }
+         *
+         * The simplest short-term fix is to configure sw_codec as a
+         * pass-through (SW_CODEC_NONE).  See prj.conf notes above.
+         */
+        struct audio_metadata *meta = net_buf_user_data(out_buf);
+
+        meta->data_coding            = PCM;
+        meta->data_len_us            = BLK_PERIOD_US;
+        meta->sample_rate_hz         = CONFIG_AUDIO_SAMPLE_RATE_HZ;
+        meta->bits_per_sample        = CONFIG_AUDIO_BIT_DEPTH_BITS;
+        meta->carried_bits_per_sample = CONFIG_AUDIO_BIT_DEPTH_BITS;
+        meta->bytes_per_location     = BLK_MULTI_CHAN_SIZE_OCTETS / CONFIG_AUDIO_OUTPUT_CHANNELS;
+        meta->interleaved            = true;
+        meta->locations              = BT_AUDIO_LOCATION_FRONT_LEFT |
+                                       BT_AUDIO_LOCATION_FRONT_RIGHT;
+        meta->bad_data               = 0;
+        meta->ref_ts_us              = 0;   /* disables presentation compensation */
+        meta->data_rx_ts_us          = audio_sync_timer_capture();
+
+        audio_datapath_stream_out(out_buf);
+        net_buf_unref(out_buf);
+    }
 }
 
-/**
- * @brief	Zbus listener to receive events from bt_mgmt.
- *
- * @param[in]	chan	Zbus channel.
- *
- * @note	Will in most cases be called from BT_RX context,
- *		so there should not be too much processing done here.
- */
-static void bt_mgmt_evt_handler(const struct zbus_channel *chan)
+/* ---------------------------------------------------------------------------
+ * SPI peripheral initialisation
+ * ---------------------------------------------------------------------------*/
+static int spi_audio_init(void)
 {
-	int ret;
-	const struct bt_mgmt_msg *msg;
-	uint8_t num_conn = 0;
+    spi_dev = DEVICE_DT_GET(MY_SPI_MASTER);
 
-	msg = zbus_chan_const_msg(chan);
-	bt_mgmt_num_conn_get(&num_conn);
+    if (!device_is_ready(spi_dev)) {
+        LOG_ERR("SPI master device not ready");
+        return -ENODEV;
+    }
 
-	switch (msg->event) {
-	case BT_MGMT_CONNECTED:
-		/* NOTE: The string below is used by the Nordic CI system */
-		LOG_INF("Connection event. Num connections: %u", num_conn);
+    struct gpio_dt_spec cs_gpio = MY_SPI_MASTER_CS_DT_SPEC;
 
-		break;
+    if (!device_is_ready(cs_gpio.port)) {
+        LOG_ERR("SPI CS GPIO not ready");
+        return -ENODEV;
+    }
 
-	case BT_MGMT_DISCONNECTED:
-		/* NOTE: The string below is used by the Nordic CI system */
-		LOG_INF("Disconnection event. Num connections: %u", num_conn);
-
-		ret = bt_content_ctrl_conn_disconnected(msg->conn);
-		if (ret) {
-			LOG_ERR("Failed to handle disconnection in content control: %d", ret);
-		}
-
-		break;
-
-	case BT_MGMT_SECURITY_CHANGED:
-		LOG_INF("Security changed");
-
-		ret = bt_content_ctrl_discover(msg->conn);
-		if (ret == -EALREADY) {
-			LOG_DBG("Discovery in progress or already done");
-		} else if (ret) {
-			LOG_ERR("Failed to start discovery of content control: %d", ret);
-		}
-
-		break;
-	case BT_MGMT_PAIRING_COMPLETE:
-		/* Do nothing */
-		break;
-
-	default:
-		LOG_WRN("Unexpected/unhandled bt_mgmt event: %d", msg->event);
-
-		break;
-	}
+    LOG_INF("SPI initialised (%d Hz)", spi_cfg.frequency);
+    return 0;
 }
 
-ZBUS_LISTENER_DEFINE(bt_mgmt_evt_listen, bt_mgmt_evt_handler);
-
-/**
- * @brief	Link zbus producers and observers.
- *
- * @return	0 for success, error otherwise.
- */
-static int zbus_link_producers_observers(void)
+/* ---------------------------------------------------------------------------
+ * main()
+ * ---------------------------------------------------------------------------*/
+int main(void)
 {
-	int ret;
+    int ret;
 
-	if (!IS_ENABLED(CONFIG_ZBUS)) {
-		return -ENOTSUP;
-	}
+    LOG_INF("nRF5340 Audio DK – SPI audio bridge starting");
 
-	ret = zbus_chan_add_obs(&button_chan, &button_evt_sub, ZBUS_ADD_OBS_TIMEOUT_MS);
-	if (ret) {
-		LOG_ERR("Failed to add button sub");
-		return ret;
-	}
+    /* ---- 1. Initialise hardware codec (CS47L63) and I2S datapath ---- */
+    /*
+     * audio_system_init() calls:
+     *   audio_datapath_init()  →  audio_i2s_init() + registers i2s_blk_comp callback
+     *   hw_codec_init()        →  cs47l63_comm_init() + starts volume subscriber thread
+     */
+    ret = audio_system_init();
+    if (ret) {
+        LOG_ERR("audio_system_init failed: %d", ret);
+        return ret;
+    }
 
-	ret = zbus_chan_add_obs(&le_audio_chan, &le_audio_evt_sub, ZBUS_ADD_OBS_TIMEOUT_MS);
-	if (ret) {
-		LOG_ERR("Failed to add le_audio sub");
-		return ret;
-	}
+    /* ---- 2. Initialise SPI master ---- */
+    ret = spi_audio_init();
+    if (ret) {
+        LOG_ERR("SPI init failed: %d", ret);
+        return ret;
+    }
 
-	ret = zbus_chan_add_obs(&bt_mgmt_chan, &bt_mgmt_evt_listen, ZBUS_ADD_OBS_TIMEOUT_MS);
-	if (ret) {
-		LOG_ERR("Failed to add bt_mgmt sub");
-		return ret;
-	}
+    /* ---- 3. Start the codec + I2S datapath ---- */
+    /*
+     * audio_system_start() calls:
+     *   hw_codec_default_conf_enable()  – configures CS47L63 clocks, GPIO,
+     *                                     ASP1 (I2S), output, PDM mic, FLL
+     *   audio_datapath_start(&audio_q_rx) – starts I2S, mic data flows into
+     *                                       audio_q_rx every 1 ms
+     *
+     * We must also enable the encoder if we want the mic data to be pulled
+     * out of audio_q_rx.  In our case the SPI thread acts as the "encoder",
+     * so we call audio_system_encoder_start() to unblock the poll signal that
+     * normally gates the encoder_thread – but our replacement SPI thread
+     * does not use that signal, so it is optional here.  It is safe to omit.
+     *
+     * Set a dummy codec config so audio_system_start() does not assert.
+     * 48 kHz PCM, no BT bitrate needed.
+     */
+    ret = audio_system_config_set(
+        CONFIG_AUDIO_SAMPLE_RATE_HZ,  /* encoder sample rate (not used) */
+        0,                             /* encoder bitrate   (0 = PCM, no LC3) */
+        CONFIG_AUDIO_SAMPLE_RATE_HZ   /* decoder sample rate */
+    );
+    if (ret) {
+        LOG_WRN("audio_system_config_set returned %d (may be harmless)", ret);
+    }
 
-	if (IS_ENABLED(CONFIG_BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP)) {
-		ret = zbus_chan_add_obs(&volume_chan, &volume_evt_sub, ZBUS_ADD_OBS_TIMEOUT_MS);
-		if (ret) {
-			LOG_ERR("Failed to add volume sub");
-			return ret;
-		}
-	}
+    audio_system_start();
+    LOG_INF("Audio system started");
 
-	return 0;
+    /* ---- 4. Start the SPI audio bridge thread ---- */
+    k_tid_t tid = k_thread_create(
+        &spi_audio_thread_data,
+        spi_audio_thread_stack,
+        SPI_AUDIO_THREAD_STACK_SIZE,
+        spi_audio_thread_fn,
+        NULL, NULL, NULL,
+        K_PRIO_PREEMPT(SPI_AUDIO_THREAD_PRIORITY),
+        0,
+        K_NO_WAIT);
+
+    ret = k_thread_name_set(tid, "spi_audio");
+    if (ret) {
+        LOG_WRN("Failed to name SPI audio thread: %d", ret);
+    }
+
+    LOG_INF("SPI audio thread started, bridge is running");
+
+    /*
+     * main() returns here; the Zephyr kernel continues scheduling
+     * the SPI audio thread and the audio datapath ISR callbacks.
+     */
+    return 0;
 }
 
 /*
- * @brief  The following configures the data for the extended advertising. This includes the
- *         Audio Stream Control Service requirements [BAP 3.7.2.1.1] in the AUX_ADV_IND Extended
- *         Announcements.
+ * =============================================================================
+ * REQUIRED CHANGE IN audio_datapath.c
+ * =============================================================================
  *
- * @param  ext_adv_buf       Pointer to the bt_data used for extended advertising.
- * @param  ext_adv_buf_size  Size of @p ext_adv_buf.
- * @param  ext_adv_count     Pointer to the number of elements added to @p adv_buf.
+ * audio_datapath_stream_out() currently always calls sw_codec_decode().
+ * For PCM-coded input (from Apollo) we need to bypass that step.
  *
- * @return  0 for success, error otherwise.
+ * In audio_datapath.c, this guard was placed before the sw_codec_decode() call:
+ *
+ *   // --- BEGIN patch for SPI PCM bypass ---
+ *   if (meta_in->data_coding == PCM) {
+ *       // Data from Apollo is already decoded PCM.
+ *       // Copy it straight into the output FIFO, mirroring what the
+ *       // memcpy loop below does after sw_codec_decode().
+ *       uint32_t out_blk_idx = ctrl_blk.out.prod_blk_idx;
+ *       for (uint32_t i = 0; i < NUM_BLKS_IN_FRAME; i++) {
+ *           memcpy(&ctrl_blk.out.fifo[out_blk_idx * BLK_MULTI_CHAN_NUM_SAMPS],
+ *                  (int16_t *)audio_frame_in->data,
+ *                  BLK_MULTI_CHAN_SIZE_OCTETS);
+ *           net_buf_pull(audio_frame_in, BLK_MULTI_CHAN_SIZE_OCTETS);
+ *           ctrl_blk.out.prod_blk_ts[out_blk_idx] =
+ *               meta_in->data_rx_ts_us + (i * BLK_PERIOD_US);
+ *           out_blk_idx = NEXT_IDX(out_blk_idx);
+ *       }
+ *       ctrl_blk.out.prod_blk_idx = out_blk_idx;
+ *       net_buf_unref(audio_frame_out);  // free the unused alloc above
+ *       return;
+ *   }
+ *   // --- END patch ---
+ *
+ 
+ *
+ * =============================================================================
+ * prj.conf additions
+ * =============================================================================
+ *
+ *   # Core audio
+ *   CONFIG_AUDIO_DEV=HEADSET
+ *   CONFIG_STREAM_BIDIRECTIONAL=y
+ *   CONFIG_AUDIO_SAMPLE_RATE_48000_HZ=y
+ *   CONFIG_AUDIO_BIT_DEPTH_16=y
+ *   CONFIG_NRF5340_AUDIO_CS47L63_DRIVER=y
+ *
+ *   # Disable BT stack entirely
+ *   CONFIG_BT=n
+ *   CONFIG_BT_LE_AUDIO=n
+ *
+ *   # SPI
+ *   CONFIG_SPI=y
+ *
+ *   # Threads – increase stack sizes if you see stack overflow warnings
+ *   CONFIG_MAIN_STACK_SIZE=4096
+ *
+ * =============================================================================
  */
-
-static int ext_adv_populate(struct bt_data *ext_adv_buf, size_t ext_adv_buf_size,
-			    size_t *ext_adv_count)
-{
-	int ret;
-	size_t ext_adv_buf_cnt = 0;
-
-	NET_BUF_SIMPLE_DEFINE_STATIC(uuid_buf, CONFIG_EXT_ADV_UUID_BUF_MAX);
-
-	ext_adv_buf[ext_adv_buf_cnt].type = BT_DATA_UUID16_SOME;
-	ext_adv_buf[ext_adv_buf_cnt].data = uuid_buf.data;
-	ext_adv_buf_cnt++;
-
-	ret = bt_r_and_c_uuid_populate(&uuid_buf);
-
-	if (ret) {
-		LOG_ERR("Failed to add adv data from renderer: %d", ret);
-		return ret;
-	}
-
-	ret = bt_content_ctrl_uuid_populate(&uuid_buf);
-
-	if (ret) {
-		LOG_ERR("Failed to add adv data from content ctrl: %d", ret);
-		return ret;
-	}
-
-	ret = bt_mgmt_manufacturer_uuid_populate(&uuid_buf, CONFIG_BT_DEVICE_MANUFACTURER_ID);
-	if (ret) {
-		LOG_ERR("Failed to add adv data with manufacturer ID: %d", ret);
-		return ret;
-	}
-
-	ext_adv_buf[ext_adv_buf_cnt].type = BT_DATA_NAME_COMPLETE;
-	ext_adv_buf[ext_adv_buf_cnt].data = CONFIG_BT_DEVICE_NAME;
-	ext_adv_buf[ext_adv_buf_cnt].data_len = sizeof(CONFIG_BT_DEVICE_NAME) - 1;
-	ext_adv_buf_cnt++;
-
-	ret = unicast_server_adv_populate(&ext_adv_buf[ext_adv_buf_cnt],
-					  ext_adv_buf_size - ext_adv_buf_cnt);
-
-	if (ret < 0) {
-		LOG_ERR("Failed to add adv data from unicast server: %d", ret);
-		return ret;
-	}
-
-	ext_adv_buf_cnt += ret;
-
-	/* Add the number of UUIDs */
-	ext_adv_buf[0].data_len = uuid_buf.len;
-
-	LOG_DBG("Size of adv data: %d, num_elements: %d", sizeof(struct bt_data) * ext_adv_buf_cnt,
-		ext_adv_buf_cnt);
-
-	*ext_adv_count = ext_adv_buf_cnt;
-
-	return 0;
-}
-
-uint8_t stream_state_get(void)
-{
-	return strm_state;
-}
-
-void streamctrl_send(struct net_buf const *const audio_frame)
-{
-	int ret;
-	static int prev_ret;
-
-	if (strm_state == STATE_STREAMING) {
-		ret = unicast_server_send(audio_frame);
-
-		if (ret != 0 && ret != prev_ret) {
-			if (ret == -ECANCELED) {
-				LOG_WRN("Sending operation cancelled");
-			} else {
-				LOG_WRN("Problem with sending LE audio data, ret: %d", ret);
-			}
-		}
-
-		prev_ret = ret;
-	}
-}
-
-int main(void)
-{
-	int ret;
-	enum bt_audio_location location;
-	static struct bt_data ext_adv_buf[CONFIG_EXT_ADV_BUF_MAX];
-
-	LOG_DBG("Main started");
-
-	size_t ext_adv_buf_cnt = 0;
-
-	ret = peripherals_init();
-	ERR_CHK(ret);
-
-	ret = fw_info_app_print();
-	ERR_CHK(ret);
-
-	ret = bt_mgmt_init();
-	ERR_CHK(ret);
-
-	ret = audio_system_init();
-	ERR_CHK(ret);
-
-	ret = zbus_subscribers_create();
-	ERR_CHK_MSG(ret, "Failed to create zbus subscriber threads");
-
-	ret = zbus_link_producers_observers();
-	ERR_CHK_MSG(ret, "Failed to link zbus producers and observers");
-
-	ret = le_audio_rx_init();
-	ERR_CHK_MSG(ret, "Failed to initialize rx path");
-
-	device_location_get(&location);
-
-	if (POPCOUNT(location) > 1) {
-		ret = unicast_server_pd_min_set(STEREO_PRES_DLY_MIN_US);
-		ERR_CHK_MSG(ret, "Failed to set min pres delay");
-		LOG_INF("Multiple locations configured, setting min pres delay to %d us",
-			STEREO_PRES_DLY_MIN_US);
-	}
-
-	ret = unicast_server_enable(le_audio_rx_data_handler, location);
-	ERR_CHK_MSG(ret, "Failed to enable LE Audio");
-
-	ret = bt_r_and_c_init();
-	ERR_CHK(ret);
-
-	ret = bt_content_ctrl_init();
-	ERR_CHK(ret);
-
-	ret = ext_adv_populate(ext_adv_buf, ARRAY_SIZE(ext_adv_buf), &ext_adv_buf_cnt);
-	ERR_CHK(ret);
-
-	ret = bt_mgmt_adv_start(0, ext_adv_buf, ext_adv_buf_cnt, NULL, 0, true);
-	ERR_CHK(ret);
-
-	return 0;
-}
