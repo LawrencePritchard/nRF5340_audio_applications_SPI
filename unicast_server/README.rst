@@ -1,3 +1,21 @@
+This application modifies the nRF5340 audio applications unicast server code to replace bluetooth with SPI.
+nRF5340 Audio DK - SPI Audio Bridge
+
+ * Audio data flow
+ * ---------------
+ *  Mic  →  CS47L63  →(I2S)→  audio_datapath RX FIFO (audio_q_rx)
+ *       →  spi_audio_thread  →(SPI)→  Apollo
+ *
+ *  Apollo →(SPI)→  spi_audio_thread  →  out.fifo (via audio_datapath_pcm_out)
+ *         →(I2S)→  CS47L63  →  headphone jack
+ *
+ * The SPI transaction size is one I2S block = BLK_MULTI_CHAN_SIZE_OCTETS bytes,
+ * transmitted every 1 ms to match the I2S interrupt cadence.
+ */
+
+
+The following is the readme for the unicast server app
+
 .. _nrf53_audio_unicast_server_app:
 
 nRF5340 Audio: Unicast server
